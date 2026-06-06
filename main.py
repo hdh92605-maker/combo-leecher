@@ -1,347 +1,945 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created by omegai.me
+COMBO LEECHER - Multi-Engine Edition
+Engines: Bing, DuckDuckGo, Yahoo, Baidu, Sogou, Yandex, Brave, Ask, AOL, Startpage
+APIs:    psbdmp.ws, scrapbin.com, pastebin archive
+"""
+
 import re
-import requests
-from bs4 import BeautifulSoup
-from tkinter import *
-from tkinter import filedialog, messagebox, ttk
 import os
-import threading
-import logging
+import sys
+import time
 import random
-import webbrowser  # Import webbrowser for opening links
-from concurrent.futures import ThreadPoolExecutor
-import ttkbootstrap as tb  # Import ttkbootstrap for advanced theming and animations
+import threading
+import json
+import urllib.parse
+import urllib.request
+import urllib.error
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Setup logging
-logging.basicConfig(filename='scraper.log', level=logging.DEBUG,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# ── optional deps ─────────────────────────────────────────────
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
 
-# Initialize global variables
-combined_pattern = re.compile(r'\b[\w\.-]+@[\w\.-]+:\w+\b')
-headers = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-    "Cache-Control": "max-age=0",
-    "Referer": "https://www.bing.com"
+try:
+    from bs4 import BeautifulSoup
+    BS4_OK = True
+except ImportError:
+    BS4_OK = False
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════
+CFG = {
+    "max_threads":        8,
+    "timeout":            15,
+    "delay_min":          0.3,
+    "delay_max":          1.2,
+    "output_file":        "combos_leeched.txt",
+    "log_file":           "leecher_log.txt",
+    "max_pages_per_engine": 3,
+    "deduplicate":        True,
+    "min_combo_length":   6,
+    "save_interval":      25,
+    "debug_paste":        False,   # True = show first 150 chars of each paste
+    "queries_per_engine": 15,
 }
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
-    # Add more user agents here
+
+# ── Paste domains to harvest from ────────────────────────────
+PASTE_DOMAINS = [
+    "pastebin.com", "hastebin.com", "ghostbin.com",
+    "paste.ee", "controlc.com", "paste2.org",
+    "ideone.com", "justpaste.it", "dpaste.com",
+    "pastecode.io", "rentry.co", "paste.fo",
+    "txt.fyi", "termbin.com", "0paste.com",
+    "paste.rs", "bpa.st", "sprunge.us", "ix.io",
 ]
-proxies = []
-site_list = ['pastebin.com', 'throwbin.com', 'zerobin.com', 'badcord.ct8.pl', 'justpaste.it']
-max_retries = 5  # Maximum number of retries for a request
 
-# Function to get random headers
-def get_random_headers():
-    headers['User-Agent'] = random.choice(user_agents)
-    return headers
+# ── Search dork templates ─────────────────────────────────────
+DORK_TEMPLATES = [
+    'site:{domain} "{keyword}"',
+    'site:pastebin.com "{keyword}" email password',
+    'site:pastebin.com "{keyword}" "@gmail.com"',
+    'site:pastebin.com "{keyword}" "@hotmail.com"',
+    'site:hastebin.com "{keyword}" combo',
+    'site:controlc.com "{keyword}" email pass',
+    '"@gmail.com:" "{keyword}"',
+    '"@hotmail.com:" "{keyword}"',
+    '"@yahoo.com:" "{keyword}"',
+    '"{keyword}" combo email:pass 2024',
+    '"{keyword}" combo email:pass 2025',
+    '"{keyword}" leaked combo list',
+    '"{keyword}" "@gmail.com" ":" paste',
+    'pastebin "{keyword}" combo hits',
+    '"{keyword}" "email" "password" pastebin',
+    'filetype:txt "{keyword}" email password',
+]
 
-# Function to load proxies from a file
-def load_proxies():
-    global proxies
-    proxy_file = filedialog.askopenfilename(title="Load Proxy File")
-    if proxy_file:
-        with open(proxy_file, "r") as f:
-            proxies = f.read().splitlines()
-        logging.info("Proxies loaded successfully.")
-        messagebox.showinfo("Success", "Proxies loaded successfully.")
-    else:
-        messagebox.showerror("Error", "No proxy file selected.")
+KEYWORDS = [
+    "combo", "email:pass", "user:pass", "mail:pass",
+    "account", "credentials", "leaked", "database",
+    "checker", "hits", "valid", "cracked",
+]
 
-# Function to get a random proxy
-def get_proxy():
-    if proxies:
-        proxy = random.choice(proxies)
-        if "@" in proxy:
-            auth, ip_port = proxy.split("@")
-            username, password = auth.split(":")
-            return {
-                "http": f"http://{username}:{password}@{ip_port}",
-                "https": f"http://{username}:{password}@{ip_port}"
-            }
-        else:
-            return {
-                "http": f"http://{proxy}",
-                "https": f"http://{proxy}"
-            }
-    else:
+# ── User-Agent pool ───────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+]
+
+# ═══════════════════════════════════════════════════════════════
+#  COLOURS
+# ═══════════════════════════════════════════════════════════════
+if sys.platform == "win32":
+    os.system("color")
+
+R   = "\033[91m"
+G   = "\033[92m"
+Y   = "\033[93m"
+B   = "\033[94m"
+M   = "\033[95m"
+C   = "\033[96m"
+W   = "\033[97m"
+DIM = "\033[2m"
+RST = "\033[0m"
+
+# ═══════════════════════════════════════════════════════════════
+#  LOGGER
+# ═══════════════════════════════════════════════════════════════
+_log_lock = threading.Lock()
+
+def log(msg, level="INFO"):
+    ts  = datetime.now().strftime("%H:%M:%S")
+    col = {"INFO": C, "OK": G, "WARN": Y, "ERR": R, "COMBO": M, "ENGINE": B}.get(level, W)
+    pfx = {"INFO": "[*]", "OK": "[+]", "WARN": "[!]", "ERR": "[-]",
+           "COMBO": "[C]", "ENGINE": "[E]"}.get(level, "[?]")
+    line = f"{DIM}{ts}{RST} {col}{pfx}{RST} {msg}"
+    with _log_lock:
+        print(line)
+        try:
+            with open(CFG["log_file"], "a", encoding="utf-8") as f:
+                f.write(f"{ts} {pfx} {msg}\n")
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════════
+#  HTTP
+# ═══════════════════════════════════════════════════════════════
+def make_session():
+    if not REQUESTS_OK:
         return None
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.5,
+                  status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    return s
 
-# Function to get keywords from a file
-def get_keywords():
-    current_path = os.path.dirname(os.path.realpath(__file__))
-    root = Tk()
-    root.withdraw()
-    key_file = filedialog.askopenfilename(initialdir=current_path, title="Load Keywords File")
-    root.destroy()
-    if key_file:
-        with open(key_file, "r", encoding='utf-8', errors='ignore') as f:
-            return f.read().splitlines()
-    else:
-        return []
+def random_ua():
+    return random.choice(USER_AGENTS)
 
-# Function to get links from HTML content
-def get_links(html):
-    data = []
-    parse_html = BeautifulSoup(html, 'html.parser')
-    links = parse_html.find_all('a', href=True)
-    exclusions = ["www.netflix.com", "www.bing.com", "microsoft.com", "wikipedia.org", 
-                  "www.imdb.com", "www.pinterest.com", "www.maps.google", ".pdf", 
-                  "www.youtube.com", "www.facebook.com", "www.instagram.com", 
-                  "http://www.google.", "www.paypal.com", "/search?q=", 
-                  "play.google.com", "steamcommunity.com", "www.reddit.com", 
-                  "www.amazon.", "business.facebook.com", "facebook.com", 
-                  "yahoo.com", "msn.com", "tiktok.com"]
-    for link in links:
-        href = link['href']
-        if all(excl not in href for excl in exclusions) and href.startswith("http"):
-            data.append(href)
-    return data
-
-# Function to fetch data with proxy support
-def fetch_data_with_proxy(url, retries=0):
-    if retries >= max_retries:
-        logging.error(f"Max retries reached for URL: {url}")
-        return []
-    proxy = get_proxy()
+def safe_get(session, url, timeout=None, extra_headers=None):
+    timeout = timeout or CFG["timeout"]
+    headers = {
+        "User-Agent":      random_ua(),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5,zh-CN;q=0.3",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection":      "keep-alive",
+        "DNT":             "1",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     try:
-        req = requests.get(url, headers=get_random_headers(), proxies=proxy, timeout=10)
-        req.raise_for_status()
-        return get_links(req.text)
-    except requests.RequestException as e:
-        logging.error(f"Error fetching data from {url} with proxy {proxy}: {e}")
-        return fetch_data_with_proxy(url, retries + 1)
+        if session and REQUESTS_OK:
+            r = session.get(url, headers=headers, timeout=timeout,
+                            allow_redirects=True, verify=False)
+            return r.text, r.status_code
+        else:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="ignore"), resp.status
+    except Exception:
+        return "", 0
 
-# Function to fetch data without proxy support
-def fetch_data_without_proxy(url):
+# ═══════════════════════════════════════════════════════════════
+#  COMBO VALIDATOR  – strict email:pass only, no CSS garbage
+# ═══════════════════════════════════════════════════════════════
+
+# CSS property names - if the "password" is one of these, reject
+_CSS_PROPS = {
+    "display","height","width","max-width","min-width","max-height","min-height",
+    "background","background-color","background-image","background-position",
+    "background-repeat","background-size","border","border-radius","border-bottom",
+    "border-top","border-left","border-right","box-shadow","box-sizing","color",
+    "content","cursor","direction","fill","flex","flex-direction","flex-shrink",
+    "flex-wrap","font","font-family","font-size","font-stretch","font-weight",
+    "gap","grid-column","grid-column-gap","grid-column-start","grid-row-start",
+    "grid-template-columns","grid-template-rows","justify-content","justify-self",
+    "left","margin","margin-bottom","margin-left","margin-right","margin-top",
+    "object-fit","object-position","opacity","outline","outline-color","outline-offset",
+    "overflow","padding","padding-bottom","padding-left","padding-right","padding-top",
+    "pointer-events","position","right","text-align","text-shadow","top","transition",
+    "vertical-align","visibility","white-space","z-index","align-items","align-self",
+    "column-gap","filter","grid-row","overflow-anchor","text-decoration","transform",
+    "word-break","word-wrap","animation","appearance","aspect-ratio","clip-path",
+    "float","inset","isolation","letter-spacing","line-height","list-style",
+    "mix-blend-mode","order","overflow-x","overflow-y","resize","rotate","scale",
+    "stroke","stroke-width","translate","unicode-bidi","user-select","will-change",
+    # JS / HTML tokens (only clear non-password HTML/JS keywords)
+    "href","src","xmlns","mailto",
+}
+
+# CSS value patterns - if password matches these, reject
+_CSS_VALUE_RE = re.compile(
+    r'^(?:'
+    r'\d+(?:px|em|rem|vh|vw|%|pt|pc|cm|mm|in|ex|ch|fr|deg|rad|turn)(?:\s|$)'
+    r'|#[0-9a-fA-F]{3,8}$'
+    r'|rgba?[(]|hsla?[(]|var[(]--|linear-gradient[(]|radial-gradient[(]'
+    r'|calc[(]|url[(]|format[(]|local[(]|env[(]|min[(]|max[(]|clamp[(]'
+    r'|!important$'
+    r')',
+    re.IGNORECASE
+)
+
+# Strict email regex
+_EMAIL_RE  = re.compile(r'^[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z]{2,10}$')
+_FAKE_TLDS = re.compile(r'\.(px|em|rem|vw|vh|pt|cm|gif|jpg|png|svg|js|css|woff|ttf)$', re.I)
+
+# Only capture email:pass (email MUST have @domain.tld)
+_COMBO_RE = re.compile(
+    r'(?<![\\w.])'
+    r'([a-zA-Z0-9][a-zA-Z0-9_.+\-]{1,62}'
+    r'@[a-zA-Z0-9][a-zA-Z0-9\-]{0,61}\.[a-zA-Z]{2,10})'
+    r':'
+    r'([^\s:,;|<>"`\x00-\x1f]{4,72})',
+    re.UNICODE
+)
+
+def extract_combos(text):
+    found = set()
+    for m in _COMBO_RE.finditer(text):
+        email = m.group(1).strip()
+        pw    = m.group(2).strip()
+        if _valid_combo(email, pw):
+            found.add(f"{email}:{pw}")
+    return found
+
+def _valid_combo(email, pw):
+    if len(email) < 6 or len(pw) < 4:
+        return False
+    if not _EMAIL_RE.match(email):
+        return False
+    if _FAKE_TLDS.search(email):
+        return False
+    if _CSS_VALUE_RE.match(pw):
+        return False
+    pw_key = pw.lower().split("(")[0].strip("-").strip()
+    if pw_key in _CSS_PROPS:
+        return False
+    if pw.startswith("--") or pw.startswith("var("):
+        return False
+    if not re.search(r'[a-zA-Z0-9]', pw):
+        return False
+    if re.fullmatch(r'\d+[a-zA-Z%]+', pw):
+        return False
+    bad = ("http", "www", "ftp", "//", "\\", "{", "}", "<", ">", "#")
+    if any(pw.lower().startswith(b) for b in bad):
+        return False
+    domain = email.split("@", 1)[1]
+    if "." not in domain or len(domain.split(".")[-1]) < 2:
+        return False
+    return True
+
+# ═══════════════════════════════════════════════════════════════
+#  RAW-TEXT FETCHER
+# ═══════════════════════════════════════════════════════════════
+_RAW_MAP = {
+    "pastebin.com": lambda u: re.sub(r'pastebin\.com/(?!raw/)', 'pastebin.com/raw/', u),
+    "hastebin.com": lambda u: re.sub(r'hastebin\.com/(?!raw/)', 'hastebin.com/raw/', u),
+    "paste.ee":     lambda u: u.replace("paste.ee/p/", "paste.ee/r/"),
+    "dpaste.com":   lambda u: u.rstrip("/") + ".txt",
+}
+
+def to_raw_url(url):
+    for domain, fn in _RAW_MAP.items():
+        if domain in url:
+            return fn(url)
+    return url
+
+def fetch_paste(session, url):
+    raw = to_raw_url(url)
+    text, code = safe_get(session, raw)
+    if code == 200 and text:
+        return text
+    text, code = safe_get(session, url)
+    return text if code == 200 else ""
+
+# ═══════════════════════════════════════════════════════════════
+#  LINK EXTRACTION FROM SEARCH RESULTS
+# ═══════════════════════════════════════════════════════════════
+def _is_valid_paste_url(url):
+    """True only if the URL's actual host is a paste site (not a search engine
+    redirect that merely contains a paste domain name inside a query param)."""
     try:
-        req = requests.get(url, headers=get_random_headers(), timeout=10)
-        req.raise_for_status()
-        return get_links(req.text)
-    except requests.RequestException as e:
-        logging.error(f"Error fetching data from {url}: {e}")
-        return []
+        p = urllib.parse.urlparse(url)
+        if p.scheme not in ('http', 'https'):
+            return False
+        host = p.netloc.lower()
+        if host.startswith('www.'):
+            host = host[4:]
+        for d in PASTE_DOMAINS:
+            if host == d or host.endswith('.' + d):
+                return True
+    except Exception:
+        pass
+    return False
 
-# Function to get data using keywords and website list
-def get_data(keyword, website_list, unique_links):
-    def fetch_data(site_link):
-        url = f'https://www.bing.com/search?q=site:{site_link} {keyword}'
-        return fetch_data_with_proxy(url) if use_proxy.get() else fetch_data_without_proxy(url)
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = executor.map(fetch_data, website_list)
-        for scraped_links in results:
-            with open("Links.txt", 'a') as save:
-                for link in scraped_links:
-                    if link not in unique_links:
-                        unique_links.add(link)
-                        save.write(link + '\n')
-    return unique_links
+def parse_links(html):
+    if BS4_OK:
+        soup  = BeautifulSoup(html, "html.parser")
+        raw   = [a["href"] for a in soup.find_all("a", href=True)
+                 if a["href"].startswith("http")]
+    else:
+        raw = re.findall(r'href=["\']?(https?://[^\s"\'<>]+)', html)
 
-# Function to leech combos from a link
-def leech_combo(link, unique_combos, combo_list):
+    good = []
+    seen = set()
+
+    def _add(u):
+        u = u.strip('.,;)')
+        if u not in seen and _is_valid_paste_url(u):
+            good.append(u)
+            seen.add(u)
+
+    for link in raw:
+        # 1. Direct paste URL
+        _add(link)
+
+        # 2. Paste URL hidden inside a redirect parameter
+        # (Yahoo: RU=, Bing: u=, generic: url= / redirect= / dest=)
+        try:
+            for match in re.finditer(
+                    r'(?:^|[?&])(?:RU|url|u|redirect|dest)=([A-Za-z0-9%._~:@!$&\'()*+,;=\-/]{10,})',
+                    link, re.IGNORECASE):
+                decoded = urllib.parse.unquote(match.group(1))
+                if decoded.startswith('http'):
+                    _add(decoded)
+        except Exception:
+            pass
+
+    return good
+
+# ═══════════════════════════════════════════════════════════════
+#  SEARCH ENGINES
+# ═══════════════════════════════════════════════════════════════
+def search_bing(session, query, page=0):
+    url = (f"https://www.bing.com/search?"
+           f"q={urllib.parse.quote(query)}&first={page*10}&count=10")
+    html, _ = safe_get(session, url, extra_headers={"Accept-Language": "en-US,en;q=0.9"})
+    return parse_links(html)
+
+def search_ddg(session, query, page=0):
+    params = {"q": query, "kl": "us-en", "s": str(page*30), "dc": str(page*30+1)}
+    url    = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode(params)
+    html, _ = safe_get(session, url)
+    raw  = re.findall(r'uddg=(https?[^&"\']+)', html)
+    good = []
+    for l in raw:
+        try:
+            l = urllib.parse.unquote(l)
+        except Exception:
+            pass
+        for d in PASTE_DOMAINS:
+            if d in l:
+                good.append(l)
+                break
+    return good
+
+def search_yahoo(session, query, page=0):
+    url = (f"https://search.yahoo.com/search?"
+           f"p={urllib.parse.quote(query)}&b={page*10+1}&pz=10")
+    html, _ = safe_get(session, url)
+    return parse_links(html)
+
+def search_baidu(session, query, page=0):
+    url = (f"https://www.baidu.com/s?"
+           f"wd={urllib.parse.quote(query)}&pn={page*10}&rn=10")
+    html, _ = safe_get(session, url, extra_headers={"Accept-Language": "zh-CN,zh;q=0.9"})
+    return parse_links(html)
+
+def search_sogou(session, query, page=1):
+    url = (f"https://www.sogou.com/web?"
+           f"query={urllib.parse.quote(query)}&page={page}")
+    html, _ = safe_get(session, url, extra_headers={"Accept-Language": "zh-CN,zh;q=0.9"})
+    return parse_links(html)
+
+def search_yandex(session, query, page=0):
+    url = (f"https://yandex.com/search/?"
+           f"text={urllib.parse.quote(query)}&p={page}")
+    html, _ = safe_get(session, url)
+    return parse_links(html)
+
+def search_brave(session, query, page=0):
+    url = (f"https://search.brave.com/search?"
+           f"q={urllib.parse.quote(query)}&offset={page*10}")
+    html, _ = safe_get(session, url)
+    return parse_links(html)
+
+def search_ask(session, query, page=1):
+    url = (f"https://www.ask.com/web?"
+           f"q={urllib.parse.quote(query)}&qo=pagination&page={page}")
+    html, _ = safe_get(session, url)
+    return parse_links(html)
+
+def search_aol(session, query, page=1):
+    url = (f"https://search.aol.com/aol/search?"
+           f"q={urllib.parse.quote(query)}&page={page}")
+    html, _ = safe_get(session, url)
+    return parse_links(html)
+
+def search_startpage(session, query, page=0):
+    url = (f"https://www.startpage.com/search?"
+           f"query={urllib.parse.quote(query)}&page={page+1}")
+    html, _ = safe_get(session, url)
+    return parse_links(html)
+
+ENGINES = {
+    "bing":       search_bing,
+    "duckduckgo": search_ddg,
+    "yahoo":      search_yahoo,
+    "baidu":      search_baidu,
+    "sogou":      search_sogou,
+    "yandex":     search_yandex,
+    "brave":      search_brave,
+    "ask":        search_ask,
+    "aol":        search_aol,
+    "startpage":  search_startpage,
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  PASTE AGGREGATOR APIs  (most reliable source)
+# ═══════════════════════════════════════════════════════════════
+def fetch_psbdmp(session, keyword, page=0):
+    """psbdmp.ws - public API indexing pastebin dumps."""
+    urls = []
     try:
-        req = requests.get(link, headers=get_random_headers(), proxies=get_proxy() if use_proxy.get() else None, timeout=10)
-        req.raise_for_status()
-        combo = combined_pattern.findall(req.text)
-        with open("Combos.txt", 'a') as save:
-            for item in combo:
-                if item not in unique_combos:
-                    unique_combos.add(item)
-                    save.write(item + '\n')
-                    combo_list.insert(END, item)
-        return unique_combos
-    except requests.RequestException as e:
-        logging.error(f"Error fetching data from {link}: {e}")
-        return unique_combos
+        api = f"https://psbdmp.ws/api/search/v3/{urllib.parse.quote(keyword)}"
+        if page > 0:
+            api += f"?page={page}"
+        text, code = safe_get(session, api, extra_headers={"Accept": "application/json"})
+        if not text or code != 200:
+            return []
+        try:
+            data  = json.loads(text)
+            items = data.get("data", data) if isinstance(data, dict) else data
+            for item in (items if isinstance(items, list) else []):
+                pid = item.get("id") or item.get("paste_id") or ""
+                if pid:
+                    urls.append(f"https://pastebin.com/raw/{pid}")
+        except Exception:
+            for pid in re.findall(r'pastebin\.com/([A-Za-z0-9]{6,10})', text):
+                urls.append(f"https://pastebin.com/raw/{pid}")
+    except Exception as e:
+        log(f"psbdmp error: {e}", "WARN")
+    return urls
 
-# Function to start scraping process
-def start_scraping(root, scraped_links_list, site_list):
-    key_list = keyword_list.get(0, END)
-    if key_list:
-        total_keywords = len(key_list)
-        keywords_processed = 0
-        links_processed = 0
-        unique_links = set()
+def fetch_scrapbin(session, keyword):
+    """scrapbin.com - paste aggregator search."""
+    urls = []
+    try:
+        text, _ = safe_get(session, f"https://scrapbin.com/search/?q={urllib.parse.quote(keyword)}")
+        for pid in set(re.findall(r'pastebin\.com/(?:raw/)?([A-Za-z0-9]{6,10})', text or "")):
+            urls.append(f"https://pastebin.com/raw/{pid}")
+        urls += parse_links(text or "")
+    except Exception as e:
+        log(f"scrapbin error: {e}", "WARN")
+    return urls
 
-        # Clear the Links.txt file before scraping
-        open("Links.txt", "w").close()
+# Pastebin navigation slugs that are NOT paste IDs
+_PASTEBIN_NAV = {
+    "signup", "login", "logout", "archive", "languages", "trends",
+    "contact", "faq", "tools", "api", "doc", "pro", "blog", "news",
+    "privacy", "cookies", "tos", "about", "u", "search", "sitemap",
+    "index", "home", "register", "reset",
+}
 
-        progress_bar.config(mode='determinate', maximum=total_keywords)
-        for keyword in key_list:
-            unique_links = get_data(keyword, site_list, unique_links)
-            keywords_processed += 1
-            progress_bar.step(1)
-            keyword_label.config(text=f"Keywords Processed: {keywords_processed}/{total_keywords}")
-            unique_links_label.config(text=f"Unique Links Scraped: {len(unique_links)}")
-            root.update()
+def fetch_pastebin_archive(session):
+    """Scrape Pastebin public archive (~50 recent pastes)."""
+    urls = []
+    try:
+        text, code = safe_get(session, "https://pastebin.com/archive")
+        if text and code == 200:
+            for pid in set(re.findall(r'href="/([A-Za-z0-9]{6,10})"', text)):
+                # Must be 6-8 chars and not a nav page
+                if len(pid) >= 6 and pid.lower() not in _PASTEBIN_NAV:
+                    urls.append(f"https://pastebin.com/raw/{pid}")
+            log(f"  pastebin archive raw IDs found: {len(urls)}", "INFO")
+    except Exception as e:
+        log(f"pastebin archive error: {e}", "WARN")
+    return urls
 
-            # Update the scraped links list in real-time
-            update_scraped_links_list(scraped_links_list)
+def fetch_via_api_all(session, keywords):
+    """Collect paste URLs from all API sources."""
+    all_urls = set()
+    kws = keywords[:8]
 
-        messagebox.showinfo("Task Complete", "All links leeched, Proceeding to leech combos!")
+    log("Stage 0: Querying paste aggregator APIs...", "INFO")
 
-        total_links = len(unique_links)
-        links_progress_bar.config(mode='determinate', maximum=total_links)
+    # psbdmp
+    pre = len(all_urls)
+    for kw in kws:
+        for pg in range(3):
+            urls = fetch_psbdmp(session, kw, pg)
+            for u in urls:
+                all_urls.add(u)
+            if not urls:
+                break
+            time.sleep(0.4)
+    log(f"  psbdmp: {len(all_urls)-pre} URLs", "OK")
 
-        unique_combos = set()
-        with open("Links.txt", 'r') as get_links_file:
-            for link in get_links_file:
-                unique_combos = leech_combo(link.strip(), unique_combos, combo_list)
-                links_processed += 1
-                links_progress_bar.step(1)
-                links_label.config(text=f"Links Processed: {links_processed}/{total_links}")
-                combos_label.config(text=f"Unique Combos Leeched: {len(unique_combos)}")
-                root.update()
+    # scrapbin
+    pre = len(all_urls)
+    for kw in kws:
+        for u in fetch_scrapbin(session, kw):
+            all_urls.add(u)
+        time.sleep(0.3)
+    log(f"  scrapbin: {len(all_urls)-pre} URLs", "OK")
 
-        start_button.config(state=NORMAL)
-        load_keywords_button.config(state=NORMAL)
-        keyword_list.config(state=NORMAL)
-        messagebox.showinfo("Task Complete", "Combo leeching finished!")
+    # pastebin archive
+    pre = len(all_urls)
+    for u in fetch_pastebin_archive(session):
+        all_urls.add(u)
+    log(f"  pastebin archive: {len(all_urls)-pre} URLs", "OK")
+
+    log(f"Stage 0 done. API total: {len(all_urls)} URLs", "OK")
+    return list(all_urls)
+
+# ═══════════════════════════════════════════════════════════════
+#  CORE LEECHER
+# ═══════════════════════════════════════════════════════════════
+class ComboLeecher:
+    def __init__(self, keywords=None, engines=None, pages=None):
+        self.keywords = keywords or KEYWORDS
+        self.engines  = engines  or list(ENGINES.keys())
+        self.pages    = pages    or CFG["max_pages_per_engine"]
+        self.session  = make_session()
+        self._seen_combos = set()
+        self._seen_urls   = set()
+        self._new_combos  = []
+        self._lock        = threading.Lock()
+        self._stats       = {
+            "urls_searched": 0,
+            "pastes_fetched": 0,
+            "combos_found": 0,
+            "engines_used": set(),
+        }
+        try:
+            import urllib3
+            urllib3.disable_warnings()
+        except Exception:
+            pass
+        self._load_existing()
+
+    def _load_existing(self):
+        if os.path.exists(CFG["output_file"]):
+            try:
+                with open(CFG["output_file"], "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            self._seen_combos.add(line.lower())
+                log(f"Loaded {len(self._seen_combos)} existing combos for dedup", "INFO")
+            except Exception:
+                pass
+
+    def _save_combos(self, combos):
+        if not combos:
+            return
+        with open(CFG["output_file"], "a", encoding="utf-8") as f:
+            for c in combos:
+                f.write(c + "\n")
+
+    def _add_combo(self, combo):
+        key = combo.lower()
+        with self._lock:
+            if key in self._seen_combos:
+                return False
+            self._seen_combos.add(key)
+            self._new_combos.append(combo)
+            self._stats["combos_found"] += 1
+            if len(self._new_combos) >= CFG["save_interval"]:
+                self._flush()
+            return True
+
+    def _flush(self):
+        if self._new_combos:
+            self._save_combos(self._new_combos)
+            self._new_combos.clear()
+
+    def _process_url(self, url):
+        with self._lock:
+            if url in self._seen_urls:
+                return 0
+            self._seen_urls.add(url)
+
+        time.sleep(random.uniform(CFG["delay_min"], CFG["delay_max"]))
+        text = fetch_paste(self.session, url)
+        if not text:
+            log(f"Empty/failed: {url[-40:]}", "WARN")
+            return 0
+
+        with self._lock:
+            self._stats["pastes_fetched"] += 1
+
+        if CFG.get("debug_paste"):
+            preview = text[:150].replace("\n", " ").replace("\r", "")
+            log(f"PREVIEW [{url[-25:]}]: {preview}", "INFO")
+
+        combos = extract_combos(text)
+        added  = 0
+        for c in combos:
+            if self._add_combo(c):
+                log(f"{G}{c}{RST}", "COMBO")
+                added += 1
+
+        if added == 0 and len(text) > 50:
+            sample = re.search(r'[\w.]+@[\w.]+', text)
+            if sample:
+                log(f"No valid combo in {url[-30:]} "
+                    f"(email-like found: {sample.group()[:30]})", "WARN")
+        return added
+
+    def _search_engine(self, engine_name, query, page):
+        fn = ENGINES.get(engine_name)
+        if not fn:
+            return []
+        time.sleep(random.uniform(CFG["delay_min"], CFG["delay_max"]))
+        try:
+            urls = fn(self.session, query, page)
+            with self._lock:
+                self._stats["urls_searched"] += len(urls)
+                self._stats["engines_used"].add(engine_name)
+            return urls
+        except Exception as e:
+            log(f"Engine {engine_name} error: {e}", "WARN")
+            return []
+
+    def _build_queries(self, extra_keywords=None):
+        kws     = self.keywords + (extra_keywords or [])
+        queries = set()
+        for kw in kws:
+            for tmpl in DORK_TEMPLATES:
+                for domain in random.sample(PASTE_DOMAINS, min(3, len(PASTE_DOMAINS))):
+                    try:
+                        queries.add(tmpl.format(keyword=kw, domain=domain))
+                    except KeyError:
+                        pass
+                try:
+                    queries.add(tmpl.format(keyword=kw, domain="pastebin.com"))
+                except KeyError:
+                    pass
+        return list(queries)
+
+    def run(self, extra_keywords=None):
+        self._print_banner()
+        all_kws = self.keywords + (extra_keywords or [])
+        queries = self._build_queries(extra_keywords)
+        log(f"Built {len(queries)} queries | {len(self.engines)} engines", "INFO")
+
+        paste_urls = set()
+
+        # Stage 0: API Aggregators (fastest & most reliable)
+        for u in fetch_via_api_all(self.session, all_kws):
+            paste_urls.add(u)
+
+        # Stage 1: Search Engines
+        log("Stage 1: Searching engines...", "INFO")
+        qpe = CFG.get("queries_per_engine", 15)
+        tasks = []
+        for engine in self.engines:
+            q_sample = random.sample(queries, min(qpe, len(queries)))
+            for q in q_sample:
+                for pg in range(self.pages):
+                    tasks.append((engine, q, pg))
+        random.shuffle(tasks)
+        log(f"Total search tasks: {len(tasks)}", "INFO")
+
+        with ThreadPoolExecutor(max_workers=CFG["max_threads"]) as ex:
+            futs = {ex.submit(self._search_engine, e, q, p): (e, q, p)
+                    for e, q, p in tasks}
+            done = 0
+            for fut in as_completed(futs):
+                try:
+                    for u in fut.result():
+                        paste_urls.add(u)
+                except Exception as err:
+                    log(f"Search error: {err}", "ERR")
+                done += 1
+                if done % 10 == 0:
+                    log(f"Search {done}/{len(tasks)} | URLs: {len(paste_urls)}", "ENGINE")
+
+        log(f"Stage 1 done. Total paste URLs: {len(paste_urls)}", "OK")
+
+        # Stage 2: Fetch & Extract
+        log(f"Stage 2: Fetching {len(paste_urls)} pastes...", "INFO")
+        url_list = list(paste_urls)
+
+        with ThreadPoolExecutor(max_workers=CFG["max_threads"]) as ex:
+            futs = {ex.submit(self._process_url, u): u for u in url_list}
+            done = 0
+            for fut in as_completed(futs):
+                try:
+                    n = fut.result()
+                    if n > 0:
+                        log(f"Got {n} combos from {list(futs.keys()).index(fut) if False else '...'}", "OK")
+                except Exception as err:
+                    log(f"Fetch error: {err}", "ERR")
+                done += 1
+                if done % 20 == 0:
+                    log(f"Fetch {done}/{len(url_list)} | "
+                        f"Combos: {self._stats['combos_found']}", "INFO")
+
+        with self._lock:
+            self._flush()
+        self._print_summary()
+
+    def _print_banner(self):
+        eng = ", ".join(self.engines[:5])
+        pad = " " * max(0, 35 - len(eng))
+        lines = [
+            "",
+            f"{B}+----------------------------------------------------------+",
+            f"|{M}     COMBO LEECHER  -  Multi-Engine Edition               {B}|",
+            f"|{C}  Engines : {eng}...{pad}{B}|",
+            f"|{C}  Keywords: {len(self.keywords):<4} Pages/Engine: {self.pages:<3} Threads: {CFG['max_threads']:<3}{B}|",
+            f"|{Y}                  Created by omegai.me                   {B}|",
+            f"+----------------------------------------------------------+{RST}",
+            "",
+        ]
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+
+    def _print_summary(self):
+        s   = self._stats
+        eng = ", ".join(sorted(s["engines_used"])) or "none"
+        lines = [
+            "",
+            f"{G}+----------------------------------------------------------+",
+            f"|                    FINAL SUMMARY                        |",
+            f"|  URLs searched  : {s['urls_searched']:<38}|",
+            f"|  Pastes fetched : {s['pastes_fetched']:<38}|",
+            f"|  Combos found   : {s['combos_found']:<38}|",
+            f"|  Output file    : {CFG['output_file']:<38}|",
+            f"+----------------------------------------------------------+{RST}",
+            "",
+        ]
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        log(f"Combos saved to {CFG['output_file']}", "OK")
+
+# ═══════════════════════════════════════════════════════════════
+#  DIRECT LEECHER  (URLs from file or single URL)
+# ═══════════════════════════════════════════════════════════════
+class DirectLeecher:
+    def __init__(self):
+        self.session = make_session()
+        self._seen   = set()
+        try:
+            import urllib3; urllib3.disable_warnings()
+        except Exception:
+            pass
+
+    def leech_urls(self, url_list, output="direct_combos.txt"):
+        log(f"Direct leeching {len(url_list)} URLs...", "INFO")
+        all_combos = []
+        with ThreadPoolExecutor(max_workers=CFG["max_threads"]) as ex:
+            futs = {ex.submit(self._fetch_extract, u): u for u in url_list}
+            for fut in as_completed(futs):
+                for c in fut.result():
+                    if c.lower() not in self._seen:
+                        self._seen.add(c.lower())
+                        all_combos.append(c)
+                        log(c, "COMBO")
+        with open(output, "w", encoding="utf-8") as f:
+            f.write("\n".join(all_combos))
+        log(f"Saved {len(all_combos)} combos to {output}", "OK")
+        return all_combos
+
+    def _fetch_extract(self, url):
+        text = fetch_paste(self.session, url)
+        return extract_combos(text) if text else set()
+
+    def leech_file(self, filepath, output="direct_combos.txt"):
+        if not os.path.exists(filepath):
+            log(f"File not found: {filepath}", "ERR")
+            return []
+        with open(filepath, "r", encoding="utf-8") as f:
+            urls = [l.strip() for l in f if l.strip().startswith("http")]
+        log(f"Loaded {len(urls)} URLs from {filepath}", "INFO")
+        return self.leech_urls(urls, output)
+
+# ═══════════════════════════════════════════════════════════════
+#  INTERACTIVE MENU
+# ═══════════════════════════════════════════════════════════════
+def interactive_menu():
+    print(f"""
+{M}{'='*56}
+  COMBO LEECHER  -  Choose Mode
+{'='*56}{RST}
+  {G}[1]{RST} Full Auto-Leech  (APIs + search engines + harvest)
+  {G}[2]{RST} Direct URL Leech (provide URL list file)
+  {G}[3]{RST} Single URL Leech
+  {G}[4]{RST} Custom Keywords + Engine Selection
+  {G}[5]{RST} Exit
+{M}{'='*56}{RST}
+""")
+    return input(f"  {C}Select [{W}1-5{C}]{RST}: ").strip()
+
+
+def run_interactive():
+    while True:
+        choice = interactive_menu()
+
+        if choice == "1":
+            pages   = input(f"  {C}Pages per engine [{W}default=3{C}]{RST}: ").strip()
+            pages   = int(pages) if pages.isdigit() else 3
+            threads = input(f"  {C}Threads [{W}default=8{C}]{RST}: ").strip()
+            threads = int(threads) if threads.isdigit() else 8
+            CFG["max_pages_per_engine"] = pages
+            CFG["max_threads"] = threads
+            eng_in  = input(
+                f"  {C}Engines (comma-sep, or ENTER for all):\n"
+                f"  {DIM}{', '.join(ENGINES.keys())}{RST}\n  > "
+            ).strip()
+            chosen  = ([e.strip().lower() for e in eng_in.split(",")
+                        if e.strip().lower() in ENGINES]
+                       if eng_in else list(ENGINES.keys()))
+            ComboLeecher(engines=chosen, pages=pages).run()
+
+        elif choice == "2":
+            fp  = input(f"  {C}Path to URL file{RST}: ").strip()
+            out = input(f"  {C}Output file [{W}direct_combos.txt{C}]{RST}: ").strip() or "direct_combos.txt"
+            DirectLeecher().leech_file(fp, out)
+
+        elif choice == "3":
+            url = input(f"  {C}Paste URL{RST}: ").strip()
+            if not url.startswith("http"):
+                log("Invalid URL", "ERR")
+                continue
+            combos = DirectLeecher().leech_urls([url], "single_combo.txt")
+            log(f"Extracted {len(combos)} combos", "OK")
+
+        elif choice == "4":
+            kw_raw  = input(f"  {C}Keywords (comma-sep){RST}: ").strip()
+            kws     = [k.strip() for k in kw_raw.split(",") if k.strip()] or KEYWORDS
+            eng_in  = input(f"  {C}Engines (comma-sep, or ENTER for all){RST}: ").strip()
+            chosen  = ([e.strip().lower() for e in eng_in.split(",")
+                        if e.strip().lower() in ENGINES]
+                       if eng_in else list(ENGINES.keys()))
+            pages   = input(f"  {C}Pages [{W}default=3{C}]{RST}: ").strip()
+            pages   = int(pages) if pages.isdigit() else 3
+            ComboLeecher(keywords=kws, engines=chosen, pages=pages).run()
+
+        elif choice == "5":
+            log("Bye!", "INFO")
+            break
+        else:
+            log("Invalid choice", "WARN")
+
+# ═══════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Combo Leecher - Multi-Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python dddd.py                              # interactive menu
+  python dddd.py --auto                       # full auto
+  python dddd.py --auto --engines bing,baidu --pages 5
+  python dddd.py --url https://pastebin.com/xxxxx
+  python dddd.py --file urls.txt
+  python dddd.py --keywords netflix,spotify
+  python dddd.py --auto --debug              # show paste previews
+        """
+    )
+    p.add_argument("--auto",     action="store_true")
+    p.add_argument("--url",      type=str)
+    p.add_argument("--file",     type=str)
+    p.add_argument("--keywords", type=str)
+    p.add_argument("--engines",  type=str)
+    p.add_argument("--pages",    type=int, default=3)
+    p.add_argument("--threads",  type=int, default=8)
+    p.add_argument("--output",   type=str)
+    p.add_argument("--debug",    action="store_true", help="Show paste content previews")
+    return p.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
+def main():
+    # Always-shown startup banner
+    banner = [
+        "",
+        f"{B}+----------------------------------------------------------+",
+        f"|{M}     COMBO LEECHER  -  Multi-Engine Edition               {B}|",
+        f"|{C}  Bing | DDG | Yahoo | Baidu | Sogou | Yandex | Brave    {B}|",
+        f"|{Y}               Created by omegai.me                      {B}|",
+        f"+----------------------------------------------------------+{RST}",
+        "",
+    ]
+    sys.stdout.write("\n".join(banner) + "\n")
+    sys.stdout.flush()
+
+    args = parse_args()
+
+    if args.output:  CFG["output_file"]          = args.output
+    if args.threads: CFG["max_threads"]           = args.threads
+    if args.pages:   CFG["max_pages_per_engine"]  = args.pages
+    if args.debug:   CFG["debug_paste"]           = True
+
+    chosen  = ([e.strip().lower() for e in args.engines.split(",")
+                if e.strip().lower() in ENGINES]
+               if args.engines else list(ENGINES.keys()))
+    keywords = ([k.strip() for k in args.keywords.split(",") if k.strip()]
+                if args.keywords else KEYWORDS)
+
+    if args.url:
+        combos = DirectLeecher().leech_urls([args.url], CFG["output_file"])
+        log(f"Done. {len(combos)} combos -> {CFG['output_file']}", "OK")
+        return
+
+    if args.file:
+        DirectLeecher().leech_file(args.file, CFG["output_file"])
+        return
+
+    if args.auto:
+        ComboLeecher(keywords=keywords, engines=chosen, pages=args.pages).run()
     else:
-        messagebox.showerror("Error", "No keywords added.")
+        run_interactive()
 
-# Function to load keywords from a file
-def load_keywords():
-    keywords = get_keywords()
-    if keywords:
-        keyword_list.delete(0, END)
-        for keyword in keywords:
-            keyword_list.insert(END, keyword)
-        start_button.config(state=NORMAL)
-    else:
-        messagebox.showerror("Error", "No keywords file selected.")
-
-# Function to update scraped links list in the GUI
-def update_scraped_links_list(scraped_links_list):
-    with open("Links.txt", "r") as file:
-        links = file.readlines()
-        scraped_links_list.delete(0, END)
-        for link in links:
-            scraped_links_list.insert(END, link.strip())
-
-# Function to toggle proxy usage
-def toggle_proxy():
-    if use_proxy.get():
-        load_proxies_button.grid(row=2, column=2, pady=5, padx=10, sticky='ew')
-    else:
-        load_proxies_button.grid_forget()
-
-# Function to create the main GUI
-def create_gui():
-    global start_button, progress_bar, keyword_label, links_progress_bar, links_label, keyword_list, load_keywords_button, links_list, notebook, scrape_tab, leech_tab, about_tab, scraped_links_list, unique_links_label, combos_label, combo_list, load_proxies_button, use_proxy, root
-
-    root = tb.Window(themename="darkly")
-    root.title("Combo Leecher")
-    root.state('zoomed')  # Set to full screen
-    root.resizable(True, True)
-
-    use_proxy = BooleanVar()  # Define use_proxy here
-
-    notebook = tb.Notebook(root, bootstyle="primary")
-    notebook.pack(fill=BOTH, expand=True)
-
-    scrape_tab = tb.Frame(notebook, bootstyle="secondary")
-    leech_tab = tb.Frame(notebook, bootstyle="secondary")
-    about_tab = tb.Frame(notebook, bootstyle="secondary")
-
-    notebook.add(scrape_tab, text="Scrape Links")
-    notebook.add(leech_tab, text="Leech Combos")
-    notebook.add(about_tab, text="About Us")
-
-    # Scrape Links Tab
-    title_label = tb.Label(scrape_tab, text="Combo Leecher", font=("Helvetica", 30, "bold"), bootstyle="inverse-dark")
-    title_label.grid(row=0, column=0, columnspan=3, pady=20)
-
-    creator_label = tb.Label(scrape_tab, text="Created by: Evil Bane", font=("Helvetica", 16), bootstyle="inverse-dark")
-    creator_label.grid(row=1, column=0, columnspan=3, pady=10)
-
-    load_keywords_button = tb.Button(scrape_tab, text="Load Keywords", command=load_keywords, bootstyle="success-outline", width=20)
-    load_keywords_button.grid(row=2, column=0, pady=10, padx=20, sticky='ew')
-
-    proxy_toggle = tb.Checkbutton(scrape_tab, text="Use Proxy", variable=use_proxy, command=toggle_proxy, bootstyle="secondary", width=20)
-    proxy_toggle.grid(row=2, column=1, pady=10, padx=20, sticky='ew')
-
-    load_proxies_button = tb.Button(scrape_tab, text="Load Proxies", command=load_proxies, bootstyle="success-outline", width=20)
-    load_proxies_button.grid(row=2, column=2, pady=5, padx=10, sticky='ew')
-    load_proxies_button.grid_forget()
-
-    keyword_frame = tb.Frame(scrape_tab, bootstyle="secondary")
-    keyword_frame.grid(row=3, column=0, columnspan=3, pady=10, padx=20, sticky='nsew')
-
-    keyword_list_scrollbar = tb.Scrollbar(keyword_frame, bootstyle="secondary")
-    keyword_list_scrollbar.pack(side=RIGHT, fill=Y)
-
-    keyword_list = Listbox(keyword_frame, height=8, yscrollcommand=keyword_list_scrollbar.set, bg="#444", fg="white", selectbackground="#4CAF50", font=("Helvetica", 16))
-    keyword_list.pack(side=LEFT, fill=BOTH, expand=True)
-    keyword_list_scrollbar.config(command=keyword_list.yview)
-
-    stats_frame = tb.Frame(scrape_tab, bootstyle="secondary")
-    stats_frame.grid(row=4, column=0, rowspan=2, columnspan=2, pady=10, padx=20, sticky='nsew')
-
-    keyword_label = tb.Label(stats_frame, text="Keywords Processed: 0/0", font=("Helvetica", 16), bootstyle="inverse-dark")
-    keyword_label.pack(pady=10)
-
-    unique_links_label = tb.Label(stats_frame, text="Unique Links Scraped: 0", font=("Helvetica", 16), bootstyle="inverse-dark")
-    unique_links_label.pack(pady=10)
-
-    start_button = tb.Button(scrape_tab, text="Start Scraping", command=lambda: threading.Thread(target=start_scraping, args=(root, scraped_links_list, site_list)).start(), bootstyle="danger", state=DISABLED, width=20)
-    start_button.grid(row=4, column=2, pady=20, padx=20, sticky='nsew')
-
-    progress_bar = tb.Progressbar(scrape_tab, mode='determinate', length=600, bootstyle="info")
-    progress_bar.grid(row=6, column=0, columnspan=3, pady=20)
-
-    scraped_links_frame = tb.Frame(scrape_tab, bootstyle="secondary")
-    scraped_links_frame.grid(row=6, column=0, columnspan=3, pady=10, padx=20, sticky='nsew')
-
-    scraped_links_scrollbar = tb.Scrollbar(scraped_links_frame, bootstyle="secondary")
-    scraped_links_scrollbar.pack(side=RIGHT, fill=Y)
-
-    scraped_links_list = Listbox(scraped_links_frame, height=8, yscrollcommand=scraped_links_scrollbar.set, bg="#444", fg="white", selectbackground="#4CAF50", font=("Helvetica", 16))
-    scraped_links_list.pack(side=LEFT, fill=BOTH, expand=True)
-    scraped_links_scrollbar.config(command=scraped_links_list.yview)
-
-    # Leech Combos Tab
-    combo_list_frame = tb.Frame(leech_tab, bootstyle="secondary")
-    combo_list_frame.pack(pady=20, padx=20, fill=BOTH, expand=True)
-
-    combo_list_scrollbar = tb.Scrollbar(combo_list_frame, bootstyle="secondary")
-    combo_list_scrollbar.pack(side=RIGHT, fill=Y)
-
-    combo_list = Listbox(combo_list_frame, height=8, yscrollcommand=combo_list_scrollbar.set, bg="#444", fg="white", selectbackground="#4CAF50", font=("Helvetica", 16))
-    combo_list.pack(side=LEFT, fill=BOTH, expand=True)
-    combo_list_scrollbar.config(command=combo_list.yview)
-
-    combos_label = tb.Label(leech_tab, text="Unique Combos Leeched: 0", font=("Helvetica", 16), bootstyle="inverse-dark")
-    combos_label.pack(pady=10)
-
-    links_label = tb.Label(leech_tab, text="Links Processed: 0/0", font=("Helvetica", 16), bootstyle="inverse-dark")
-    links_label.pack(pady=10)
-
-    links_progress_bar = tb.Progressbar(leech_tab, mode='determinate', length=600, bootstyle="info")
-    links_progress_bar.pack(pady=20)
-
-    # About Us Tab
-    about_title_label = tb.Label(about_tab, text="About Combo Leecher", font=("Helvetica", 30, "bold"), bootstyle="inverse-dark")
-    about_title_label.pack(pady=20)
-
-    about_creator_label = tb.Label(about_tab, text="Created by: Evil Bane", font=("Helvetica", 20), bootstyle="inverse-dark")
-    about_creator_label.pack(pady=10)
-
-    contact_label = tb.Label(about_tab, text="Contact:", font=("Helvetica", 18), bootstyle="inverse-dark")
-    contact_label.pack(pady=10)
-
-    telegram_label = tb.Label(about_tab, text="Telegram: https://t.me/Evil_BaneOP", font=("Helvetica", 16), bootstyle="inverse-dark", cursor="hand2")
-    telegram_label.pack(pady=5)
-    telegram_label.bind("<Button-1>", lambda e: webbrowser.open("https://t.me/Evil_BaneOP"))
-
-    github_label = tb.Label(about_tab, text="GitHub: https://github.com/Evil-Bane", font=("Helvetica", 16), bootstyle="inverse-dark", cursor="hand2")
-    github_label.pack(pady=5)
-    github_label.bind("<Button-1>", lambda e: webbrowser.open("https://github.com/Evil-Bane"))
-
-    root.mainloop()
 
 if __name__ == "__main__":
-    create_gui()
+    main()
