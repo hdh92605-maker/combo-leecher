@@ -14,6 +14,8 @@ Combo Leecher is a Python-based GUI application designed to scrape and leech com
 - **Multithreading:** Efficient scraping using multiple threads.
 - **Advanced Theming:** Aesthetic and functional GUI with `ttkbootstrap`.
 
+<img src="https://i.ibb.co/9mgYCwy9/Screenshot-2026-06-05-18-00-19.jpg" alt="A descriptive title" width="500">
+
 ## Installation
 
 To run Combo Leecher, you need Python installed on your machine. Follow the steps below to set up the application:
